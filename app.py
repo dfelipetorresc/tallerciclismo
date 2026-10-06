@@ -4,17 +4,19 @@ import requests
 import streamlit as st
 
 # ==========================================
-# 1. CREDENCIALES DE STRAVA Y BASE DE DATOS
+# 1. CONFIGURACIÓN DE CREDENCIALES
 # ==========================================
 STRAVA_CLIENT_ID = "143229"
 STRAVA_CLIENT_SECRET = "ef4ef0f0e079b6acf6d3b303388fe25249ed0103"
-STRAVA_REFRESH_TOKEN = "5d376fe78f24b2a8d11c0ed88ad7893f3f508a8e"
+
+# URL a la que regresa Strava tras dar autorización
+REDIRECT_URI = "http://localhost:8501"
 
 DB_NAME = "taller_bici.db"
 
 
 # ==========================================
-# 2. FUNCIONES DE BASE DE DATOS (SQLITE)
+# 2. BASE DE DATOS (SQLITE)
 # ==========================================
 def get_db_connection():
   conn = sqlite3.connect(DB_NAME)
@@ -26,7 +28,6 @@ def init_db():
   conn = get_db_connection()
   cursor = conn.cursor()
 
-  # Tabla de Componentes
   cursor.execute("""
         CREATE TABLE IF NOT EXISTS componentes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +40,6 @@ def init_db():
         )
     """)
 
-  # Tabla de Historial de Mantenimientos
   cursor.execute("""
         CREATE TABLE IF NOT EXISTS historial (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +52,6 @@ def init_db():
         )
     """)
 
-  # Tabla para controlar qué actividades de Strava ya fueron procesadas
   cursor.execute("""
         CREATE TABLE IF NOT EXISTS strava_actividades (
             id INTEGER PRIMARY KEY,
@@ -62,11 +61,10 @@ def init_db():
         )
     """)
 
-  # Carga inicial de componentes para Spiro Freedom y Spiro Mítica
   cursor.execute("SELECT COUNT(*) FROM componentes")
   if cursor.fetchone()[0] == 0:
     componentes_base = [
-        # Repuestos Spiro Freedom (Carretera)
+        # Spiro Freedom (Carretera)
         (
             "Cadena 12v",
             "Spiro Freedom",
@@ -102,7 +100,7 @@ def init_db():
             5000.0,
             datetime.now().strftime("%Y-%m-%d"),
         ),
-        # Repuestos Spiro Mítica (Rodillo)
+        # Spiro Mítica (Rodillo)
         (
             "Cadena Entreno Rodillo",
             "Spiro Mítica",
@@ -124,7 +122,6 @@ def init_db():
 
 
 def agregar_kilometros(bici_nombre, km_a_sumar):
-  """Suma km a todos los componentes activos de una bicicleta."""
   conn = get_db_connection()
   cursor = conn.cursor()
   cursor.execute(
@@ -142,7 +139,6 @@ def agregar_kilometros(bici_nombre, km_a_sumar):
 def registrar_mantenimiento(
     componente_id, tipo_servicio, notas, reiniciar_km=True
 ):
-  """Registra la intervención en el historial y reinicia kilómetros si es cambio."""
   conn = get_db_connection()
   cursor = conn.cursor()
   cursor.execute(
@@ -174,112 +170,91 @@ def registrar_mantenimiento(
   conn.close()
 
 
-# Inicializar la base de datos al arrancar
 init_db()
 
 
 # ==========================================
-# 3. LÓGICA DE CONEXIÓN CON STRAVA
+# 3. AUTENTICACIÓN Y SINCRONIZACIÓN STRAVA
 # ==========================================
-def obtener_access_token():
-  """Renueva el Access Token de Strava automáticamente usando el Refresh Token."""
+def obtener_token_desde_code(code):
+  """Cambia el código temporal recibido por un Access Token activo."""
   url = "https://www.strava.com/api/v3/oauth/token"
   payload = {
       "client_id": STRAVA_CLIENT_ID,
       "client_secret": STRAVA_CLIENT_SECRET,
-      "refresh_token": STRAVA_REFRESH_TOKEN,
-      "grant_type": "refresh_token",
+      "code": code,
+      "grant_type": "authorization_code",
   }
-  try:
-    res = requests.post(url, data=payload, timeout=8)
-    if res.status_code == 200:
-      return res.json().get("access_token"), None
-    else:
-      return (
-          None,
-          f"Error Strava Auth ({res.status_code}): {res.json().get('message')}",
-      )
-  except Exception as e:
-    return None, f"Error de conexión con Strava: {str(e)}"
+  res = requests.post(url, data=payload, timeout=8)
+  if res.status_code == 200:
+    return res.json().get("access_token"), None
+  return None, f"Error Auth ({res.status_code}): {res.text}"
 
 
-def sincronizar_strava():
-  """Consulta actividades de Strava, filtra duplicados y distribuye km según la bici."""
-  token, err = obtener_access_token()
-  if not token:
-    st.sidebar.error(err)
-    return False, err
-
+def procesar_actividades_strava(access_token):
+  """Descarga las rodadas de Strava e incrementa los km según la bici."""
   url = "https://www.strava.com/api/v3/athlete/activities"
-  headers = {"Authorization": f"Bearer {token}"}
+  headers = {"Authorization": f"Bearer {access_token}"}
+  res = requests.get(url, headers=headers, params={"per_page": 10}, timeout=8)
 
-  try:
-    res = requests.get(url, headers=headers, params={"per_page": 10}, timeout=8)
-    if res.status_code != 200:
-      return False, f"Error API Strava ({res.status_code})"
+  if res.status_code != 200:
+    return False, f"Error al consultar Strava: {res.status_code}"
 
-    actividades = res.json()
-    if not actividades:
-      return True, "No se encontraron actividades en Strava."
+  actividades = res.json()
+  if not actividades:
+    return True, "No hay actividades registradas en Strava."
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+  conn = get_db_connection()
+  cursor = conn.cursor()
 
-    km_freedom = 0.0
-    km_mitica = 0.0
-    act_procesadas = 0
+  km_freedom = 0.0
+  km_mitica = 0.0
+  act_procesadas = 0
 
-    for act in actividades:
-      act_id = act["id"]
+  for act in actividades:
+    act_id = act["id"]
+    cursor.execute("SELECT id FROM strava_actividades WHERE id = ?", (act_id,))
+
+    if cursor.fetchone() is None:
+      dist_km = act.get("distance", 0) / 1000.0
+      nombre_act = act.get("name", "Rodada")
+      fecha_act = act.get("start_date_local", "")[:10]
+      tipo_act = act.get("type", "")
+
+      # Asignación automática
+      if tipo_act == "VirtualRide" or "rodillo" in nombre_act.lower():
+        km_mitica += dist_km
+      else:
+        km_freedom += dist_km
+
       cursor.execute(
-          "SELECT id FROM strava_actividades WHERE id = ?", (act_id,)
+          """
+                INSERT INTO strava_actividades (id, nombre, distancia_km, fecha)
+                VALUES (?, ?, ?, ?)
+            """,
+          (act_id, nombre_act, dist_km, fecha_act),
       )
+      act_procesadas += 1
 
-      if cursor.fetchone() is None:
-        dist_km = act.get("distance", 0) / 1000.0
-        nombre_act = act.get("name", "Rodada")
-        fecha_act = act.get("start_date_local", "")[:10]
-        tipo_act = act.get("type", "")
+  conn.commit()
+  conn.close()
 
-        # Asignación automática: Rodillo (VirtualRide/nombre) vs Carretera
-        if tipo_act == "VirtualRide" or "rodillo" in nombre_act.lower():
-          km_mitica += dist_km
-        else:
-          km_freedom += dist_km
-
-        cursor.execute(
-            """
-                    INSERT INTO strava_actividades (id, nombre, distancia_km, fecha)
-                    VALUES (?, ?, ?, ?)
-                """,
-            (act_id, nombre_act, dist_km, fecha_act),
-        )
-
-        act_procesadas += 1
-
-    conn.commit()
-    conn.close()
-
-    if act_procesadas > 0:
-      if km_freedom > 0:
-        agregar_kilometros("Spiro Freedom", km_freedom)
-      if km_mitica > 0:
-        agregar_kilometros("Spiro Mítica", km_mitica)
-
-      return (
-          True,
-          f"¡Sincronizado! {act_procesadas} rodada(s) nueva(s). (+{km_freedom:.1f}"
-          f" km Spiro Freedom / +{km_mitica:.1f} km Spiro Mítica)",
-      )
-    else:
-      return True, "Todas tus rodadas recientes ya estaban sincronizadas."
-
-  except Exception as e:
-    return False, f"Error de sincronización: {str(e)}"
+  if act_procesadas > 0:
+    if km_freedom > 0:
+      agregar_kilometros("Spiro Freedom", km_freedom)
+    if km_mitica > 0:
+      agregar_kilometros("Spiro Mítica", km_mitica)
+    return (
+        True,
+        f"¡Sincronizado! {act_procesadas} salida(s) cargadas (+{km_freedom:.1f}"
+        f" km Spiro Freedom / +{km_mitica:.1f} km Spiro Mítica).",
+    )
+  else:
+    return True, "Tus salidas ya se encontraban al día."
 
 
 # ==========================================
-# 4. INTERFAZ GRÁFICA (STREAMLIT)
+# 4. INTERFAZ EN STREAMLIT
 # ==========================================
 st.set_page_config(
     page_title="Taller Digital de Ciclismo", page_icon="🚲", layout="wide"
@@ -288,19 +263,36 @@ st.set_page_config(
 st.title("🔧 Taller Digital & Control de Componentes")
 st.caption("Seguimiento de desgaste mecánico y sincronización con Strava")
 
-# Sidebar
+# Sidebar - Autenticación Strava
 st.sidebar.header("⚙️ Menú Principal")
+st.sidebar.subheader("🟧 Conexión con Strava")
 
-st.sidebar.subheader("🟧 Sincronización Strava")
-if st.sidebar.button("🔄 Importar Rodadas Nuevas", use_container_width=True):
+# Verificar si Strava devolvió un código en la URL
+query_params = st.query_params
+if "code" in query_params:
+  code_recibido = query_params["code"]
   with st.spinner("Conectando con Strava..."):
-    exito, msj = sincronizar_strava()
-    if exito:
-      st.sidebar.success(msj)
-      st.rerun()
+    token, err = obtener_token_desde_code(code_recibido)
+    if token:
+      exito, msj = procesar_actividades_strava(token)
+      if exito:
+        st.sidebar.success(msj)
+      else:
+        st.sidebar.error(msj)
+    else:
+      st.sidebar.error(err)
+  # Limpiar la URL después de procesar
+  st.query_params.clear()
+
+# Botón de conexión OAuth
+auth_url = f"https://www.strava.com/oauth/authorize?client_id={STRAVA_CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}&approval_prompt=auto&scope=read,activity:read_all"
+st.sidebar.link_button(
+    "🔗 Sincronizar con Strava", auth_url, use_container_width=True
+)
 
 st.sidebar.markdown("---")
 
+# Salida Manual
 with st.sidebar.expander("🚴 Agregar Salida Manual"):
   bici_sel = st.selectbox("Bicicleta", ["Spiro Freedom", "Spiro Mítica"])
   km_input = st.number_input(
@@ -311,6 +303,7 @@ with st.sidebar.expander("🚴 Agregar Salida Manual"):
     st.success(f"+{km_input} km sumados a {bici_sel}.")
     st.rerun()
 
+# Agregar Repuesto
 with st.sidebar.expander("🆕 Agregar Nuevo Repuesto"):
   with st.form("form_nuevo_comp"):
     nom_comp = st.text_input("Nombre del Repuesto", "Disco de Freno 160mm")
@@ -332,10 +325,10 @@ with st.sidebar.expander("🆕 Agregar Nuevo Repuesto"):
       )
       conn.commit()
       conn.close()
-      st.success(f"'{nom_comp}' agregado correctamente.")
+      st.success(f"'{nom_comp}' guardado.")
       st.rerun()
 
-# Dashboard Principal
+# Tabs Principales
 tab1, tab2, tab3 = st.tabs(
     ["📊 Salud de Repuestos", "🛠️ Registrar Mantenimiento", "📜 Historial"]
 )
@@ -402,12 +395,7 @@ with tab2:
             "Ajuste / Calibración de Tensión",
         ],
     )
-    notas_serv = st.text_area(
-        "Notas del Taller",
-        placeholder=(
-            "Ej. Se instalaron cables de freno nuevos con funda de teflón."
-        ),
-    )
+    notas_serv = st.text_area("Notas del Taller", placeholder="Detalles...")
 
     if st.button("⚙️ Guardar Registro en Historial"):
       comp_id = opciones[comp_sel]
